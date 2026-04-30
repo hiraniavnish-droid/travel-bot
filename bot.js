@@ -63,6 +63,11 @@ const REPLY_DELAY_MAX_MS    = parseInt(process.env.REPLY_DELAY_MAX_MS    || '750
 // indicator stays visible. WhatsApp clients can drop a stale indicator
 // after a few seconds — re-emitting every ~2.5s keeps it on screen.
 const TYPING_REFRESH_MS     = parseInt(process.env.TYPING_REFRESH_MS     || '2500', 10);
+// Maximum number of separate WhatsApp messages Priya can emit in a single
+// turn. Replies are split on the [NEXT] marker. If Gemini emits more chunks
+// than this, the overflow is merged into the last allowed bubble. Acts as
+// a hard ceiling against any "dump the whole catalog" loop.
+const MAX_BUBBLES           = parseInt(process.env.MAX_BUBBLES           || '4', 10);
 
 // Token bucket. Refills continuously at RATE_LIMIT_PER_MINUTE/60 tokens/sec.
 let _rlTokens     = RATE_LIMIT_PER_MINUTE;
@@ -144,6 +149,25 @@ async function safeSend(jid, content, opts = {}) {
   }
 
   return sock.sendMessage(jid, content);
+}
+
+// Split a single Gemini reply on [NEXT] markers into multiple WhatsApp
+// messages. Hard cap at MAX_BUBBLES — anything beyond gets merged into the
+// last allowed bubble so we can never emit more than N messages per turn,
+// no matter how the model behaves.
+function splitReply(reply) {
+  if (!reply) return [];
+  const parts = reply
+    .split(/\n*\[NEXT\]\n*/g)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length <= 1) return [reply.trim()];
+  if (parts.length <= MAX_BUBBLES) return parts;
+  // Overflow: merge the tail into the last allowed bubble
+  const head = parts.slice(0, MAX_BUBBLES - 1);
+  const tail = parts.slice(MAX_BUBBLES - 1).join('\n\n');
+  console.log(`✂️  Reply had ${parts.length} chunks — capped to ${MAX_BUBBLES} (overflow merged into last bubble)`);
+  return [...head, tail];
 }
 
 // ─── SAFETY: don't let Baileys teardown crashes kill the process ───────────
@@ -233,10 +257,14 @@ Send EXACTLY 2-3 tours in this format (use *bold*, line breaks):
 💰 ₹14,999 for couple · ₹7,500 per person
 Calangute, Baga, North-South Goa beaches
 
+[NEXT]
+
 🏛️ *Goa Heritage & Beaches*
 📅 5 Days / 4 Nights
 💰 ₹17,499 for couple · ₹8,750 per person
 Old Goa churches, Dudhsagar Falls, beach hopping
+
+[NEXT]
 
 ✈️ _Land package only — flights not included_
 
@@ -312,6 +340,59 @@ Rules:
 - If the source data doesn't have a field (departure), simply omit that line — don't write "N/A".
 - Inclusions/Exclusions: split the "WHATS_INCLUDED" text from the data into two bullet lists if it has both sections; otherwise just bullet under "*Inclusions*".
 - The closing line MUST be a natural human invitation to a call — never a mechanical "Reply BOOK" instruction. Adapt to the customer's language.
+
+═══════════════════════════════════════════════════════════
+## MULTI-MESSAGE REPLIES (use [NEXT] to split into bubbles)
+═══════════════════════════════════════════════════════════
+You can send your reply as MULTIPLE WhatsApp messages instead of one wall of text. Insert the literal token \`[NEXT]\` on its own line wherever you want a new message bubble to start. The system splits on \`[NEXT]\` and sends each chunk as a separate WhatsApp message with a natural typing delay between each.
+
+**Hard cap:** Maximum 4 bubbles per reply. The system enforces this — anything beyond 4 gets merged into the last bubble. So plan accordingly. Don't try to defeat the cap.
+
+**WHEN TO SPLIT (Mode A — Discovery):**
+- Each tour gets its OWN bubble. So 2 tours = 2 bubbles, 3 tours = 3 bubbles.
+- The "✈️ _Land package only — flights not included_" footer + your closing question can be its OWN final bubble (cleaner) or appended to the last tour bubble (more compact). Either is fine.
+- Optional first bubble: a one-line lead-in like "Sure! Here are some Rajasthan options 🌟" before the tour bubbles.
+
+**WHEN NEVER TO SPLIT:**
+- **Mode B (Full Itinerary card):** ALWAYS one bubble. NEVER include [NEXT] in a Mode B reply. Staff need to forward the whole card as one message; splitting breaks that.
+- **Reassurance one-liners** during handoff state: one bubble.
+- **Short replies** under ~80 characters: one bubble. Don't split a "Yes, sure! 😊" into two messages — that's weird.
+- **Hot lead callback prompts:** one bubble.
+
+**Example Mode A with 3 bubbles (2 tours + footer):**
+
+Sure! Here are some Goa options 🌟
+
+[NEXT]
+
+🏖️ *Goa Beach Bliss*
+📅 4 Days / 3 Nights
+💰 ₹14,999 for couple · ₹7,500 per person
+Calangute, Baga, North-South Goa beaches
+
+[NEXT]
+
+🏛️ *Goa Heritage & Beaches*
+📅 5 Days / 4 Nights
+💰 ₹17,499 for couple · ₹8,750 per person
+Old Goa churches, Dudhsagar Falls, beach hopping
+
+✈️ _Land package only — flights not included_
+
+Any of these click? 😊
+
+(That's 3 bubbles total. With 3 tours you'd be at 4 bubbles which is exactly the cap.)
+
+═══════════════════════════════════════════════════════════
+## CATALOG-OVERLOAD DEFENSE
+═══════════════════════════════════════════════════════════
+If the customer asks for "all packages", "send me everything", "show me 10 options", "list all your tours", or anything that would dump the catalog: politely decline and redirect.
+
+Real consultants curate. They don't dump 190 options.
+
+Reply (one bubble, no [NEXT]): "Hehe — way too many to send! 😅 Let me pick the best 2-3 for you. What kind of trip are you imagining — beaches, mountains, culture, adventure?"
+
+Once they answer, share 2-3 in Mode A as normal.
 
 ═══════════════════════════════════════════════════════════
 ## EXPLORATORY QUERIES — ENGAGE, DON'T BAIL
@@ -860,10 +941,17 @@ async function handleIncoming(from, userMessage) {
       }
     }
 
-    // Customer-facing reply: rate-limited, with "typing…" presence + jitter.
-    await safeSend(from, { text: reply });
+    // Customer-facing reply: split on [NEXT] (capped at MAX_BUBBLES), then
+    // send each bubble separately. Each bubble goes through safeSend so it
+    // gets its own typing presence + jittered delay + rate-limit token.
+    const bubbles = splitReply(reply);
+    for (const bubble of bubbles) {
+      await safeSend(from, { text: bubble });
+    }
 
-    userMem.history.push({ role: 'model', content: reply });
+    // Persist the joined reply (without [NEXT] markers) to history so the
+    // conversation reads cleanly when Gemini sees prior context.
+    userMem.history.push({ role: 'model', content: bubbles.join('\n\n') });
 
     if (userMem.history.length > HISTORY_LIMIT) {
       userMem.history = userMem.history.slice(-HISTORY_LIMIT);
@@ -886,8 +974,11 @@ async function handleIncoming(from, userMessage) {
         if (reply2) {
           console.log(`[${from}] Priya (after model switch): ${reply2}`);
           userMem.history.push({ role: 'user', content: userMessage });
-          await safeSend(from, { text: reply2 });
-          userMem.history.push({ role: 'model', content: reply2 });
+          const bubbles2 = splitReply(reply2);
+          for (const bubble of bubbles2) {
+            await safeSend(from, { text: bubble });
+          }
+          userMem.history.push({ role: 'model', content: bubbles2.join('\n\n') });
           if (userMem.history.length > HISTORY_LIMIT) {
             userMem.history = userMem.history.slice(-HISTORY_LIMIT);
           }
@@ -943,6 +1034,7 @@ app.get('/status', (req, res) => {
       min: REPLY_DELAY_MIN_MS,
       max: REPLY_DELAY_MAX_MS,
     },
+    maxBubblesPerReply: MAX_BUBBLES,
   });
 });
 
