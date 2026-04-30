@@ -38,6 +38,94 @@ const SESSION_DIR           = path.join(process.cwd(), 'auth_session');
 const CONVERSATIONS_DIR     = path.join(SESSION_DIR, 'conversations');
 const RECONNECT_BACKOFF_MS  = 3000;
 
+// ─── ANTI-BAN: OUTBOUND RATE LIMIT + HUMAN-LIKE TIMING ─────────────────────
+// Why this exists:
+// 1) A runaway loop on a Gemini error (or any logic bug) could fire dozens
+//    of messages per second. WhatsApp's anti-spam systems treat that as a
+//    bot signal regardless of intent. The token bucket caps us hard.
+// 2) Replying in 200ms every time is itself a bot fingerprint. Real humans
+//    have variable latency. We add Gaussian-distributed jitter and a
+//    "typing…" presence so each outbound message looks human.
+//
+// Tunable via Railway Variables:
+//   RATE_LIMIT_PER_MINUTE  (default 30) — global outbound message ceiling
+//   REPLY_DELAY_MEAN_MS    (default 4000) — mean of the typing delay
+//   REPLY_DELAY_STDDEV_MS  (default 1500) — stddev of the typing delay
+//   REPLY_DELAY_MIN_MS     (default 2000) — clamp lower bound
+//   REPLY_DELAY_MAX_MS     (default 8000) — clamp upper bound
+
+const RATE_LIMIT_PER_MINUTE = parseInt(process.env.RATE_LIMIT_PER_MINUTE || '30', 10);
+const REPLY_DELAY_MEAN_MS   = parseInt(process.env.REPLY_DELAY_MEAN_MS   || '4000', 10);
+const REPLY_DELAY_STDDEV_MS = parseInt(process.env.REPLY_DELAY_STDDEV_MS || '1500', 10);
+const REPLY_DELAY_MIN_MS    = parseInt(process.env.REPLY_DELAY_MIN_MS    || '2000', 10);
+const REPLY_DELAY_MAX_MS    = parseInt(process.env.REPLY_DELAY_MAX_MS    || '8000', 10);
+
+// Token bucket. Refills continuously at RATE_LIMIT_PER_MINUTE/60 tokens/sec.
+let _rlTokens     = RATE_LIMIT_PER_MINUTE;
+let _rlLastRefill = Date.now();
+let _rlWaitCount  = 0; // how many times we had to wait — surfaced via /status
+
+function _refillTokens() {
+  const now = Date.now();
+  const elapsedSec = (now - _rlLastRefill) / 1000;
+  if (elapsedSec <= 0) return;
+  const refill = elapsedSec * (RATE_LIMIT_PER_MINUTE / 60);
+  if (refill > 0) {
+    _rlTokens = Math.min(RATE_LIMIT_PER_MINUTE, _rlTokens + refill);
+    _rlLastRefill = now;
+  }
+}
+
+async function acquireSendToken() {
+  // Block until a token is available. Worst-case wait ≈ 2s at 30/min.
+  // Loops in case multiple senders are racing for the last token.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    _refillTokens();
+    if (_rlTokens >= 1) {
+      _rlTokens -= 1;
+      return;
+    }
+    const need = 1 - _rlTokens;
+    const waitMs = Math.max(100, Math.ceil((need / (RATE_LIMIT_PER_MINUTE / 60)) * 1000));
+    _rlWaitCount += 1;
+    console.log(`⏳ Outbound rate limit reached — waiting ${waitMs}ms before next send (waits=${_rlWaitCount})`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+}
+
+// Box-Muller transform → approximately normal distribution. Clamped to the
+// configured min/max so we never hang the bot for 30s on a long tail draw.
+function humanReplyDelayMs() {
+  const u1 = Math.random() || 1e-9;
+  const u2 = Math.random();
+  const z  = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  const ms = REPLY_DELAY_MEAN_MS + z * REPLY_DELAY_STDDEV_MS;
+  return Math.max(REPLY_DELAY_MIN_MS, Math.min(REPLY_DELAY_MAX_MS, Math.round(ms)));
+}
+
+// safeSend: ALWAYS use this instead of sock.sendMessage for outbound.
+// 1. acquires a global rate-limit token (blocks if bucket is empty)
+// 2. emits "typing…" presence (composing)
+// 3. waits a human-jittered delay
+// 4. emits "online but not typing" presence (paused)
+// 5. sends the message
+//
+// opts.skipTyping = true → skip steps 2-4. Use for internal handoff alerts
+// where realism doesn't matter and speed does.
+async function safeSend(jid, content, opts = {}) {
+  await acquireSendToken();
+
+  if (!opts.skipTyping) {
+    try { await sock.sendPresenceUpdate('composing', jid); } catch (_) {}
+    const delay = humanReplyDelayMs();
+    await new Promise((r) => setTimeout(r, delay));
+    try { await sock.sendPresenceUpdate('paused', jid); } catch (_) {}
+  }
+
+  return sock.sendMessage(jid, content);
+}
+
 // ─── SAFETY: don't let Baileys teardown crashes kill the process ───────────
 process.on('uncaughtException', (e) => {
   console.error('⚠️  uncaughtException:', e?.message || e);
@@ -74,6 +162,7 @@ function maybeSwitchModel(errMsg) {
 }
 
 console.log(`🤖 Using Gemini model: ${activeModel} (fallbacks: ${GEMINI_FALLBACK_MODELS.join(', ')})`);
+console.log(`🛡️  Rate limit: ${RATE_LIMIT_PER_MINUTE}/min · reply delay ~${REPLY_DELAY_MEAN_MS}ms ±${REPLY_DELAY_STDDEV_MS}ms (clamp ${REPLY_DELAY_MIN_MS}-${REPLY_DELAY_MAX_MS}ms)`);
 
 // ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Priya, a friendly travel consultant for The Tourism Experts (India).
@@ -704,9 +793,11 @@ async function handleIncoming(from, userMessage) {
 
       if (HUMAN_HANDOFF_NUMBER) {
         try {
-          await sock.sendMessage(HUMAN_HANDOFF_NUMBER, {
+          // Internal alert — skip typing presence/jitter, but still go
+          // through the rate limiter so a runaway loop can't spam ourselves.
+          await safeSend(HUMAN_HANDOFF_NUMBER, {
             text: `🔥 *Hot Lead — Ready for Handoff*\n\n📞 Number: ${from.replace('@s.whatsapp.net', '')}\n💬 Last message: "${userMessage}"`,
-          });
+          }, { skipTyping: true });
           console.log('🔥 Handoff notification sent!');
         } catch (e) {
           console.error('Handoff notification failed:', e.message);
@@ -714,7 +805,8 @@ async function handleIncoming(from, userMessage) {
       }
     }
 
-    await sock.sendMessage(from, { text: reply });
+    // Customer-facing reply: rate-limited, with "typing…" presence + jitter.
+    await safeSend(from, { text: reply });
 
     userMem.history.push({ role: 'model', content: reply });
 
@@ -739,7 +831,7 @@ async function handleIncoming(from, userMessage) {
         if (reply2) {
           console.log(`[${from}] Priya (after model switch): ${reply2}`);
           userMem.history.push({ role: 'user', content: userMessage });
-          await sock.sendMessage(from, { text: reply2 });
+          await safeSend(from, { text: reply2 });
           userMem.history.push({ role: 'model', content: reply2 });
           if (userMem.history.length > HISTORY_LIMIT) {
             userMem.history = userMem.history.slice(-HISTORY_LIMIT);
@@ -753,7 +845,7 @@ async function handleIncoming(from, userMessage) {
     }
 
     try {
-      await sock.sendMessage(from, {
+      await safeSend(from, {
         text: "Sorry, I'm having a little trouble right now! I'll get back to you shortly. 😊",
       });
     } catch (_) {}
@@ -771,6 +863,8 @@ app.get('/status', (req, res) => {
   const persistedCount = fs.existsSync(CONVERSATIONS_DIR)
     ? fs.readdirSync(CONVERSATIONS_DIR).filter((f) => f.endsWith('.json')).length
     : 0;
+  // Surface live token-bucket state so we can see if we're ever throttling.
+  _refillTokens();
   res.json({
     hasQR: Boolean(latestQR),
     isConnecting,
@@ -783,6 +877,17 @@ app.get('/status', (req, res) => {
       : [],
     activeUsers: Object.keys(memory).length,
     persistedConversations: persistedCount,
+    rateLimit: {
+      perMinute: RATE_LIMIT_PER_MINUTE,
+      tokensAvailable: Math.round(_rlTokens * 100) / 100,
+      timesThrottled: _rlWaitCount,
+    },
+    replyDelayMs: {
+      mean: REPLY_DELAY_MEAN_MS,
+      stddev: REPLY_DELAY_STDDEV_MS,
+      min: REPLY_DELAY_MIN_MS,
+      max: REPLY_DELAY_MAX_MS,
+    },
   });
 });
 
@@ -850,7 +955,9 @@ app.post('/new-lead', async (req, res) => {
 
     const firstMessage = `Hi ${name || 'there'}! 👋 Thanks for your interest${destination ? ` in ${destination}` : ''}. I'm Priya from The Tourism Experts — here to help you plan the perfect trip! Are you still looking at${dates ? ` ${dates}` : ' those dates'}?`;
 
-    await sock.sendMessage(jid, { text: firstMessage });
+    // Even outbound webhook messages go through safeSend — typing presence
+    // + jitter + global rate limit. Cold outbound is the highest-risk path.
+    await safeSend(jid, { text: firstMessage });
 
     memory[jid] = {
       history: [{ role: 'model', content: firstMessage }],
