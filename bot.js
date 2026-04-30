@@ -55,10 +55,14 @@ const RECONNECT_BACKOFF_MS  = 3000;
 //   REPLY_DELAY_MAX_MS     (default 8000) — clamp upper bound
 
 const RATE_LIMIT_PER_MINUTE = parseInt(process.env.RATE_LIMIT_PER_MINUTE || '30', 10);
-const REPLY_DELAY_MEAN_MS   = parseInt(process.env.REPLY_DELAY_MEAN_MS   || '4000', 10);
-const REPLY_DELAY_STDDEV_MS = parseInt(process.env.REPLY_DELAY_STDDEV_MS || '1500', 10);
-const REPLY_DELAY_MIN_MS    = parseInt(process.env.REPLY_DELAY_MIN_MS    || '2000', 10);
-const REPLY_DELAY_MAX_MS    = parseInt(process.env.REPLY_DELAY_MAX_MS    || '8000', 10);
+const REPLY_DELAY_MEAN_MS   = parseInt(process.env.REPLY_DELAY_MEAN_MS   || '5500', 10);
+const REPLY_DELAY_STDDEV_MS = parseInt(process.env.REPLY_DELAY_STDDEV_MS || '1200', 10);
+const REPLY_DELAY_MIN_MS    = parseInt(process.env.REPLY_DELAY_MIN_MS    || '3500', 10);
+const REPLY_DELAY_MAX_MS    = parseInt(process.env.REPLY_DELAY_MAX_MS    || '7500', 10);
+// How often to re-emit the "composing" presence event so the typing
+// indicator stays visible. WhatsApp clients can drop a stale indicator
+// after a few seconds — re-emitting every ~2.5s keeps it on screen.
+const TYPING_REFRESH_MS     = parseInt(process.env.TYPING_REFRESH_MS     || '2500', 10);
 
 // Token bucket. Refills continuously at RATE_LIMIT_PER_MINUTE/60 tokens/sec.
 let _rlTokens     = RATE_LIMIT_PER_MINUTE;
@@ -117,9 +121,25 @@ async function safeSend(jid, content, opts = {}) {
   await acquireSendToken();
 
   if (!opts.skipTyping) {
+    // First "typing…" event
     try { await sock.sendPresenceUpdate('composing', jid); } catch (_) {}
-    const delay = humanReplyDelayMs();
-    await new Promise((r) => setTimeout(r, delay));
+
+    // Wait the human-like duration, but RE-EMIT composing every
+    // TYPING_REFRESH_MS so the indicator stays visible the whole time.
+    // (WhatsApp clients can hide a stale composing event after a few
+    // seconds, which is why long single-shot waits felt like the typing
+    // dot only flashed briefly.)
+    const total = humanReplyDelayMs();
+    let elapsed = 0;
+    while (elapsed < total) {
+      const slice = Math.min(TYPING_REFRESH_MS, total - elapsed);
+      await new Promise((r) => setTimeout(r, slice));
+      elapsed += slice;
+      if (elapsed < total) {
+        try { await sock.sendPresenceUpdate('composing', jid); } catch (_) {}
+      }
+    }
+
     try { await sock.sendPresenceUpdate('paused', jid); } catch (_) {}
   }
 
@@ -209,22 +229,28 @@ Send EXACTLY 2-3 tours in this format (use *bold*, line breaks):
  Pick one phrase appropriate to the conversation, don't always use the same.]
 
 🏖️ *Goa Beach Bliss*
-📅 4 Days / 3 Nights · 💰 ₹14,999
+📅 4 Days / 3 Nights
+💰 ₹14,999 for couple · ₹7,500 per person
 Calangute, Baga, North-South Goa beaches
 
 🏛️ *Goa Heritage & Beaches*
-📅 5 Days / 4 Nights · 💰 ₹17,499
+📅 5 Days / 4 Nights
+💰 ₹17,499 for couple · ₹8,750 per person
 Old Goa churches, Dudhsagar Falls, beach hopping
+
+✈️ _Land package only — flights not included_
 
 [Natural close in the customer's language — e.g. "Any of these catch your eye? Want the full itinerary for one?" / "Inme se koi pasand aaya? Full plan bhej doon?" 😊]
 
 Rules:
 - Always 2 or 3 tours per message — never 1, never 4+.
 - Pick a tour-relevant emoji prefix (🏖️ beach, 🏔️ mountain, 🏛️ heritage, 🛕 spiritual, 🌍 international, 🦁 wildlife, ❄️ cold places, etc.).
-- Title in *bold*, then "📅 duration · 💰 price" on next line, then a one-line highlights summary.
+- Title in *bold*, then "📅 duration" on its own line, then "💰 ₹X for couple · ₹Y per person" on its own line, then a one-line highlights summary.
+- Per-person price = couple price ÷ 2 (catalog prices are for 2 adults sharing). Round per-person to a clean number (nearest 50/100).
 - One blank line between tours.
-- End with a follow-up nudging them naturally — phrased in their language.
-- If price is missing, write "Price on request" instead of an amount.
+- ALWAYS finish with the italic line: "✈️ _Land package only — flights not included_" (translate the words but keep the airplane emoji and italics format).
+- End with a follow-up nudging them naturally AFTER the flights line — phrased in their language.
+- If price is missing, write "Price on request" instead of an amount, and skip the per-person breakdown for that tour.
 - Vary your lead-in and close phrasing — don't say the same thing every message.
 
 ═══════════════════════════════════════════════════════════
@@ -239,9 +265,9 @@ Format EXACTLY like this:
 🌟 *Gujarat Dwarka Somnath Gir Safari* 🌟
 
 📅 *Duration:* 5 Days / 4 Nights
-💰 *Price:* ₹17,999 per person
+💰 *Price:* ₹17,999 for couple (₹9,000 per person)
+✈️ *Flights:* Not included — quoted separately
 🛫 *Departure:* Ex Ahmedabad Airport
-👥 *Group Size:* 2 Adults
 
 ✨ *About this trip*
 Combine Gujarat's spiritual heritage with wildlife adventure. Visit the sacred Dwarka and Somnath temples followed by the wilderness of Gir National Park.
@@ -279,9 +305,11 @@ If this looks good, I can have someone from our team give you a quick call to wa
 
 Rules:
 - One tour per message in this mode — never two.
-- Use the emoji icons exactly as shown above (📅 💰 🛫 👥 ✨ 📍 ✅ ❌ 🌟).
+- Use the emoji icons exactly as shown above (📅 💰 ✈️ 🛫 ✨ 📍 ✅ ❌ 🌟). DO NOT include 👥 *Group Size* — couple pricing already conveys this.
+- 💰 *Price:* line MUST show couple total AND per-person in the format "₹X for couple (₹Y per person)". Per-person = couple ÷ 2, rounded to a clean number.
+- ✈️ *Flights:* Not included — quoted separately. ALWAYS include this line right after the price line.
 - For each day, format as "*Day N – Title*" on one line, detail on the next.
-- If the source data doesn't have a field (departure, group size), simply omit that line — don't write "N/A".
+- If the source data doesn't have a field (departure), simply omit that line — don't write "N/A".
 - Inclusions/Exclusions: split the "WHATS_INCLUDED" text from the data into two bullet lists if it has both sections; otherwise just bullet under "*Inclusions*".
 - The closing line MUST be a natural human invitation to a call — never a mechanical "Reply BOOK" instruction. Adapt to the customer's language.
 
@@ -364,6 +392,33 @@ Do NOT add any tags. Do NOT re-trigger [HANDOFF].
 This tag clears the handoff state so the rest of the conversation starts fresh. Do NOT include both [HANDOFF] and [RESET_HANDOFF] in the same reply — the new topic isn't a hot lead yet, just a pivot.
 
 If you can't tell whether the new message is "related" or "pivot", default to scenario A (reassure) — better to be patient than to interrupt a pending callback.
+
+═══════════════════════════════════════════════════════════
+## PRICING & GROUP SIZE — IMPORTANT
+═══════════════════════════════════════════════════════════
+ALL prices in the catalog (the PRICE field) are LAND-ONLY and quoted for **2 ADULTS sharing** (a couple / double occupancy).
+
+**Default display rules (already covered in Mode A and Mode B above, but repeat here for clarity):**
+- Always show BOTH the couple total AND per-person price.
+- Per-person = couple price ÷ 2. Round to a clean number (nearest 50 or 100, e.g. ₹9,000 not ₹8,999.50).
+- Always state "Land package only — flights not included" / "✈️ *Flights:* Not included".
+
+**When the customer asks for a different group size** (e.g. "what's the price for 4 adults?", "how much for 3 of us?", "family of 5", "for 6 people"):
+1. Calculate APPROXIMATE total: per-person × number of adults. Show your math briefly.
+   Example: User asks "what would it be for 4 adults?" on a ₹17,999/couple package.
+   You reply: "Roughly ₹9,000 × 4 = *₹36,000* for 4 adults (approximate, land-only)."
+2. ALWAYS add this caveat on the same message:
+   "This is approximate — actual price depends on room sharing, hotel availability, and dates. Our team will share the exact final quote on the call. 🌟"
+3. For odd numbers (3, 5, 7), still show per-person × number, plus the caveat. Mention that 3rd/5th adult pricing depends on whether they take a separate room or share — team will confirm.
+4. **Children / infants:** if the customer mentions kids, say "kids' rates are different (usually 50-75% of adult rate depending on age and bed sharing) — our team will confirm exact on the call."
+5. **Single traveller:** quote as "single supplement applies — usually around 1.4× the per-person rate. Team will confirm exact."
+
+**When the customer asks "is this with flights?" / "flights included?":**
+Reply clearly: "Nope, this is just the land package — hotels, transfers, sightseeing, meals as specified. Flights are quoted separately so you can pick what suits your dates and city. Want me to flag this for the team to share live fare options too?"
+
+**NEVER make up a flight price.** If asked for a flight quote, say the team will share live fare options on the call. Don't guess.
+
+**NEVER hide the per-person price.** Even if the customer just asked the couple price, show both — it's how customers compare across packages.
 
 ═══════════════════════════════════════════════════════════
 ## OTHER RULES
