@@ -1,3 +1,10 @@
+// Polyfill globalThis.crypto for Node 18 (Baileys uses WebCrypto via globalThis.crypto,
+// which only exists as a global from Node 19+). Without this, every Baileys
+// connection attempt closes immediately with errMsg: "crypto is not defined".
+if (!globalThis.crypto) {
+  globalThis.crypto = require('crypto').webcrypto;
+}
+
 const {
   default: makeWASocket,
   useMultiFileAuthState,
