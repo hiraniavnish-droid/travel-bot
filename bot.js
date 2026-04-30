@@ -25,11 +25,17 @@ const GEMINI_KEY            = process.env.GEMINI_KEY || '';
 const HUMAN_HANDOFF_NUMBER  = process.env.HUMAN_HANDOFF_NUMBER || ''; // e.g. 919876543210@s.whatsapp.net
 const PACKAGES_CSV_URL      = process.env.PACKAGES_CSV_URL || '';     // published Google Sheet CSV
 const PORT                  = process.env.PORT || 3000;
-const HISTORY_LIMIT         = 6; // 3 user + 3 bot messages
+// HISTORY_LIMIT counts BOTH user and bot messages. 40 = ~20 turns.
+// Override via Railway Variables: HISTORY_LIMIT=60 etc.
+const HISTORY_LIMIT         = parseInt(process.env.HISTORY_LIMIT || '40', 10);
 const GEMINI_MODEL          = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 // Try these in order if the primary model returns 404 / "not found" / "no longer available"
 const GEMINI_FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.5-pro', 'gemini-pro-latest'];
 const SESSION_DIR           = path.join(process.cwd(), 'auth_session');
+// Conversations live INSIDE the auth_session volume mount (so they persist
+// across deploys), but in their own subdir so we can preserve them when
+// /reset wipes Baileys auth files.
+const CONVERSATIONS_DIR     = path.join(SESSION_DIR, 'conversations');
 const RECONNECT_BACKOFF_MS  = 3000;
 
 // ─── SAFETY: don't let Baileys teardown crashes kill the process ───────────
@@ -127,9 +133,76 @@ async function getPackages() {
   }
 }
 
-// ─── IN-MEMORY STORAGE ─────────────────────────────────────────────────────
+// ─── IN-MEMORY + DISK-PERSISTED STORAGE ────────────────────────────────────
+// memory holds the live state. Each entry mirrors a JSON file on disk
+// at CONVERSATIONS_DIR/<jid_safe>.json so it survives restarts.
 const memory = {};
 let latestQR = null;
+
+// Convert a JID like "919xxxxxxxxxx@s.whatsapp.net" to a safe filename.
+function jidToFilename(jid) {
+  return jid.replace(/[^a-zA-Z0-9_-]/g, '_') + '.json';
+}
+
+// Persist one customer's conversation atomically. Atomic = write to .tmp
+// then rename, so a crash mid-write never leaves a corrupt file.
+function persistConversation(jid) {
+  const u = memory[jid];
+  if (!u) return;
+  try {
+    if (!fs.existsSync(CONVERSATIONS_DIR)) {
+      fs.mkdirSync(CONVERSATIONS_DIR, { recursive: true });
+    }
+    const data = {
+      jid,
+      history: u.history,
+      handedOff: !!u.handedOff,
+      lastSeen: Date.now(),
+    };
+    const file = path.join(CONVERSATIONS_DIR, jidToFilename(jid));
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    console.error(`Persist failed for ${jid}:`, e.message);
+  }
+}
+
+// Load all persisted conversations into memory on startup. A corrupted
+// file logs a warning and is skipped — other customers are unaffected.
+function loadConversationsFromDisk() {
+  try {
+    if (!fs.existsSync(CONVERSATIONS_DIR)) {
+      fs.mkdirSync(CONVERSATIONS_DIR, { recursive: true });
+      console.log(`💾 Created conversations dir: ${CONVERSATIONS_DIR}`);
+      return 0;
+    }
+    let loaded = 0;
+    for (const f of fs.readdirSync(CONVERSATIONS_DIR)) {
+      if (!f.endsWith('.json')) continue;
+      const full = path.join(CONVERSATIONS_DIR, f);
+      try {
+        const raw = fs.readFileSync(full, 'utf8');
+        const data = JSON.parse(raw);
+        if (data.jid && Array.isArray(data.history)) {
+          memory[data.jid] = {
+            history: data.history,
+            handedOff: !!data.handedOff,
+            lastSeen: data.lastSeen,
+          };
+          loaded++;
+        }
+      } catch (e) {
+        console.error(`Conv load failed (${f}):`, e.message);
+      }
+    }
+    console.log(`💾 Loaded ${loaded} persisted conversation(s) from disk`);
+    return loaded;
+  } catch (e) {
+    console.error('Conversations load error:', e.message);
+    return 0;
+  }
+}
 
 // ─── WHATSAPP STATE ─────────────────────────────────────────────────────────
 let sock;
@@ -161,6 +234,9 @@ function wipeAuthSession() {
     }
     let removed = 0;
     for (const entry of fs.readdirSync(SESSION_DIR, { withFileTypes: true })) {
+      // Preserve persisted conversations across /reset — they're customer
+      // data, not Baileys auth. Wipe everything else.
+      if (entry.name === 'conversations') continue;
       const full = path.join(SESSION_DIR, entry.name);
       try {
         if (entry.isDirectory()) {
@@ -173,7 +249,7 @@ function wipeAuthSession() {
         console.error(`Wipe entry failed (${entry.name}):`, e.message);
       }
     }
-    console.log(`🗑️  Cleared ${removed} auth entry/entries from ${SESSION_DIR}`);
+    console.log(`🗑️  Cleared ${removed} auth entry/entries from ${SESSION_DIR} (conversations preserved)`);
   } catch (e) {
     console.error('Wipe error:', e.message);
   }
@@ -338,6 +414,9 @@ async function handleIncoming(from, userMessage) {
     if (userMem.history.length > HISTORY_LIMIT) {
       userMem.history = userMem.history.slice(-HISTORY_LIMIT);
     }
+
+    // Persist after each turn so the conversation survives restarts
+    persistConversation(from);
   } catch (e) {
     const trimmed = (e?.message || String(e)).slice(0, 500);
     console.error('AI error:', trimmed);
@@ -358,6 +437,7 @@ async function handleIncoming(from, userMessage) {
           if (userMem.history.length > HISTORY_LIMIT) {
             userMem.history = userMem.history.slice(-HISTORY_LIMIT);
           }
+          persistConversation(from);
           return;
         }
       } catch (e2) {
@@ -381,12 +461,20 @@ app.get('/', (req, res) => res.send('Priya bot is running ✅'));
 
 // Diagnostic endpoint — useful to check live state without waiting for logs
 app.get('/status', (req, res) => {
+  const persistedCount = fs.existsSync(CONVERSATIONS_DIR)
+    ? fs.readdirSync(CONVERSATIONS_DIR).filter((f) => f.endsWith('.json')).length
+    : 0;
   res.json({
     hasQR: Boolean(latestQR),
     isConnecting,
     reconnectPending: Boolean(reconnectTimer),
-    sessionFiles: fs.existsSync(SESSION_DIR) ? fs.readdirSync(SESSION_DIR) : [],
+    activeModel,
+    historyLimit: HISTORY_LIMIT,
+    sessionFiles: fs.existsSync(SESSION_DIR)
+      ? fs.readdirSync(SESSION_DIR).filter((n) => n !== 'conversations')
+      : [],
     activeUsers: Object.keys(memory).length,
+    persistedConversations: persistedCount,
   });
 });
 
@@ -460,6 +548,7 @@ app.post('/new-lead', async (req, res) => {
       history: [{ role: 'model', content: firstMessage }],
       handedOff: false,
     };
+    persistConversation(jid);
 
     console.log(`📥 New lead initiated for ${jid}`);
     res.json({ success: true });
@@ -472,6 +561,8 @@ app.post('/new-lead', async (req, res) => {
 app.listen(PORT, () => console.log(`🌐 Server running on port ${PORT}`));
 
 // ─── START ──────────────────────────────────────────────────────────────────
+loadConversationsFromDisk();
+console.log(`💾 HISTORY_LIMIT: ${HISTORY_LIMIT} messages per customer`);
 connectToWhatsApp().catch((err) =>
   console.error('Initial connect failed:', err?.message || err)
 );
