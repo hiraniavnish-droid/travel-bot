@@ -210,6 +210,28 @@ For non-buying handoffs (destinations not in catalog, complex group bookings), u
 "Let me check with my team and get back to you!" + [HANDOFF]
 
 ═══════════════════════════════════════════════════════════
+## AFTER A HANDOFF — WHEN STATE SAYS in_handoff: true
+═══════════════════════════════════════════════════════════
+You will see "STATE: in_handoff: true" in the context when the customer was previously handed off and is awaiting a callback from the team. NEVER go silent. Always reply.
+
+Two scenarios:
+
+**A) New message is RELATED to the same booking** (e.g. "when will they call?", "ok thanks", "should I share my email", asks about same tour again, payment questions about same tour): briefly reassure them. Keep it ONE-LINE-SHORT. Examples:
+- "Our team will cover all that on the call — should be very soon 🌟"
+- "They'll call you shortly with all the next steps! 🙌"
+- "Hold tight — the call should be in your slot. They'll handle it then ⏰"
+
+Do NOT add any tags. Do NOT re-trigger [HANDOFF].
+
+**B) New message PIVOTS to a NEW destination or new exploration intent** (e.g. previously asked about Goa and was handed off, now says "what about Dubai?" / "do you have honeymoon packages?" / "any europe options?" / "tell me about Singapore"): TREAT THIS AS A FRESH DISCOVERY QUERY. Run Mode A — share 2-3 relevant tours for the new topic. AT THE END of your reply, on a new line by itself, add the tag:
+
+[RESET_HANDOFF]
+
+This tag clears the handoff state so the rest of the conversation starts fresh. Do NOT include both [HANDOFF] and [RESET_HANDOFF] in the same reply — the new topic isn't a hot lead yet, just a pivot.
+
+If you can't tell whether the new message is "related" or "pivot", default to scenario A (reassure) — better to be patient than to interrupt a pending callback.
+
+═══════════════════════════════════════════════════════════
 ## OTHER RULES
 ═══════════════════════════════════════════════════════════
 - For destinations not in the tours below: "Let me check with my team and get back to you!" then [HANDOFF]
@@ -533,9 +555,11 @@ async function connectToWhatsApp() {
         '';
 
       if (!text.trim()) return;
-      if (memory[from]?.handedOff) return;
+      // NOTE: We no longer return early when handedOff is true. The bot keeps
+      // replying — Priya is told via prompt state to either reassure them
+      // (callback coming) or reset & pivot on a new topic.
 
-      console.log(`[${from}] Customer: ${text}`);
+      console.log(`[${from}] Customer: ${text}${memory[from]?.handedOff ? ' (in handoff)' : ''}`);
       await handleIncoming(from, text);
     });
   } finally {
@@ -554,9 +578,17 @@ async function handleIncoming(from, userMessage) {
   const relevantTours = findRelevantTours(userMessage, userMem.history, 6);
   console.log(`[${from}] Relevant tours: ${relevantTours.map((t) => t.title).join(' | ')}`);
   const packagesBlock = relevantTours.length ? formatToursForPrompt(relevantTours) : '';
-  const fullPrompt = packagesBlock
+
+  // Pass current handoff state to Priya so she can decide between reassuring
+  // (same topic) or pivoting (new topic). See "AFTER A HANDOFF" prompt section.
+  const stateBlock = userMem.handedOff
+    ? '\n\n## STATE\nin_handoff: true (customer was handed off and is awaiting a callback from the team)'
+    : '';
+
+  let fullPrompt = packagesBlock
     ? `${SYSTEM_PROMPT}\n\n## RELEVANT TOURS (pick 2-3 of these to share)\n\n${packagesBlock}`
     : SYSTEM_PROMPT;
+  fullPrompt += stateBlock;
 
   const chatHistory = userMem.history.map((m) => ({
     role: m.role,
@@ -578,6 +610,18 @@ async function handleIncoming(from, userMessage) {
     console.log(`[${from}] Priya: ${reply}`);
 
     userMem.history.push({ role: 'user', content: userMessage });
+
+    // Process [RESET_HANDOFF] FIRST — customer pivoted to a new topic.
+    // We strip it and clear the handoff state. Per the prompt, the LLM
+    // should never include both [RESET_HANDOFF] and [HANDOFF] in the same
+    // reply, but we handle them in order just in case.
+    if (reply.includes('[RESET_HANDOFF]')) {
+      reply = reply.replace(/\[RESET_HANDOFF\]/g, '').trim();
+      if (userMem.handedOff) {
+        console.log(`🔄 Handoff reset for ${from} — customer pivoted to new topic`);
+        userMem.handedOff = false;
+      }
+    }
 
     if (reply.includes('[HANDOFF]')) {
       reply = reply.replace('[HANDOFF]', '').trim();
