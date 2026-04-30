@@ -17,6 +17,16 @@ const HUMAN_HANDOFF_NUMBER  = process.env.HUMAN_HANDOFF_NUMBER || ''; // e.g. 91
 const PACKAGES_CSV_URL      = process.env.PACKAGES_CSV_URL || '';     // published Google Sheet CSV
 const PORT                  = process.env.PORT || 3000;
 const HISTORY_LIMIT         = 6; // 3 user + 3 bot messages
+const SESSION_DIR           = path.join(process.cwd(), 'auth_session');
+const RECONNECT_BACKOFF_MS  = 3000;
+
+// ─── SAFETY: don't let Baileys teardown crashes kill the process ───────────
+process.on('uncaughtException', (e) => {
+  console.error('⚠️  uncaughtException:', e?.message || e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('⚠️  unhandledRejection:', e?.message || e);
+});
 
 // ─── AI SETUP ──────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(GEMINI_KEY);
@@ -62,70 +72,133 @@ async function getPackages() {
 }
 
 // ─── IN-MEMORY STORAGE ─────────────────────────────────────────────────────
-// { "9190000@s.whatsapp.net": { history: [...], handedOff: false } }
 const memory = {};
-
-// Latest QR code (stored so /qr page can serve it)
 let latestQR = null;
 
-// ─── WHATSAPP ───────────────────────────────────────────────────────────────
+// ─── WHATSAPP STATE ─────────────────────────────────────────────────────────
 let sock;
+let isConnecting = false;     // single-flight guard
+let reconnectTimer = null;    // backoff timer
+
+// Tear down the current socket without throwing. Critically: attach a no-op
+// 'error' listener to the underlying WebSocket so that a "WebSocket was closed
+// before the connection was established" event doesn't bubble up as unhandled.
+function safeSocketTeardown() {
+  try {
+    if (!sock) return;
+    try { sock.ev?.removeAllListeners?.(); } catch (_) {}
+    try { sock.ws?.on?.('error', () => {}); } catch (_) {}
+    try { sock.ws?.removeAllListeners?.('open'); } catch (_) {}
+    try { sock.end?.(undefined); } catch (_) {}
+  } catch (_) {}
+}
+
+// Wipe CONTENTS of the auth folder, never the folder itself.
+// On Railway the folder is a volume mount point — rmdir on it always fails
+// with EBUSY. We only delete files/subdirs inside.
+function wipeAuthSession() {
+  try {
+    if (!fs.existsSync(SESSION_DIR)) {
+      fs.mkdirSync(SESSION_DIR, { recursive: true });
+      console.log('🗑️  Auth dir created (was missing)');
+      return;
+    }
+    let removed = 0;
+    for (const entry of fs.readdirSync(SESSION_DIR, { withFileTypes: true })) {
+      const full = path.join(SESSION_DIR, entry.name);
+      try {
+        if (entry.isDirectory()) {
+          fs.rmSync(full, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(full);
+        }
+        removed++;
+      } catch (e) {
+        console.error(`Wipe entry failed (${entry.name}):`, e.message);
+      }
+    }
+    console.log(`🗑️  Cleared ${removed} auth entry/entries from ${SESSION_DIR}`);
+  } catch (e) {
+    console.error('Wipe error:', e.message);
+  }
+}
+
+function scheduleReconnect(delayMs = RECONNECT_BACKOFF_MS) {
+  if (reconnectTimer) return; // already pending
+  console.log(`⏳ Reconnect scheduled in ${delayMs}ms`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToWhatsApp().catch((err) =>
+      console.error('Reconnect failed:', err?.message || err)
+    );
+  }, delayMs);
+}
 
 async function connectToWhatsApp() {
-  // Clean up any prior socket so listeners don't pile up across resets
-  try { if (sock) { sock.ev.removeAllListeners(); sock.end(undefined); } } catch (_) {}
+  if (isConnecting) {
+    console.log('⏳ connectToWhatsApp already in progress — skipping duplicate call');
+    return;
+  }
+  isConnecting = true;
 
-  const { state, saveCreds } = await useMultiFileAuthState('auth_session');
+  try {
+    // Tear down any prior socket cleanly (no thrown errors)
+    safeSocketTeardown();
 
-  sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-  });
+    const { state, saveCreds } = await useMultiFileAuthState('auth_session');
 
-  sock.ev.on('creds.update', saveCreds);
+    sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+    });
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    // Defense-in-depth: silence any raw WebSocket errors so they don't crash node
+    try { sock.ws?.on?.('error', (e) => console.error('ws error:', e?.message || e)); } catch (_) {}
 
-    if (qr) {
-      latestQR = qr;
-      console.log('\n📱 QR ready — open /qr in your browser to scan it!');
-      qrcode.generate(qr, { small: true });
-    }
+    sock.ev.on('creds.update', saveCreds);
 
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      console.log('Connection closed. Reconnecting:', shouldReconnect);
-      if (shouldReconnect) connectToWhatsApp();
-    } else if (connection === 'open') {
-      console.log('✅ WhatsApp connected!');
-      latestQR = null;
-    }
-  });
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg?.message || msg.key.fromMe) return;
+      if (qr) {
+        latestQR = qr;
+        console.log('\n📱 QR ready — open /qr in your browser to scan it!');
+        try { qrcode.generate(qr, { small: true }); } catch (_) {}
+      }
 
-    const from = msg.key.remoteJid;
-    // Ignore group messages
-    if (from.endsWith('@g.us')) return;
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        console.log(`Connection closed (code=${code}). Reconnecting: ${shouldReconnect}`);
+        if (shouldReconnect) scheduleReconnect();
+      } else if (connection === 'open') {
+        console.log('✅ WhatsApp connected!');
+        latestQR = null;
+      }
+    });
 
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      '';
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      const msg = messages[0];
+      if (!msg?.message || msg.key.fromMe) return;
 
-    if (!text.trim()) return;
+      const from = msg.key.remoteJid;
+      if (from.endsWith('@g.us')) return;
 
-    // Skip if already handed off to human
-    if (memory[from]?.handedOff) return;
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        '';
 
-    console.log(`[${from}] Customer: ${text}`);
-    await handleIncoming(from, text);
-  });
+      if (!text.trim()) return;
+      if (memory[from]?.handedOff) return;
+
+      console.log(`[${from}] Customer: ${text}`);
+      await handleIncoming(from, text);
+    });
+  } finally {
+    isConnecting = false;
+  }
 }
 
 // ─── CORE HANDLER ──────────────────────────────────────────────────────────
@@ -133,13 +206,11 @@ async function handleIncoming(from, userMessage) {
   if (!memory[from]) memory[from] = { history: [], handedOff: false };
   const userMem = memory[from];
 
-  // Fetch live packages from Google Sheet
   const packagesData = await getPackages();
   const fullPrompt = packagesData
     ? `${SYSTEM_PROMPT}\n\n## Current Packages (use ONLY these)\n\n${packagesData}`
     : SYSTEM_PROMPT;
 
-  // Build Gemini chat history
   const chatHistory = userMem.history.map((m) => ({
     role: m.role,
     parts: [{ text: m.content }],
@@ -156,10 +227,8 @@ async function handleIncoming(from, userMessage) {
 
     console.log(`[${from}] Priya: ${reply}`);
 
-    // Save user message to history
     userMem.history.push({ role: 'user', content: userMessage });
 
-    // Check for handoff signal
     if (reply.includes('[HANDOFF]')) {
       reply = reply.replace('[HANDOFF]', '').trim();
       userMem.handedOff = true;
@@ -176,21 +245,20 @@ async function handleIncoming(from, userMessage) {
       }
     }
 
-    // Send reply to customer
     await sock.sendMessage(from, { text: reply });
 
-    // Save bot reply to history
     userMem.history.push({ role: 'model', content: reply });
 
-    // Trim to last N messages
     if (userMem.history.length > HISTORY_LIMIT) {
       userMem.history = userMem.history.slice(-HISTORY_LIMIT);
     }
   } catch (e) {
     console.error('AI error:', e.message);
-    await sock.sendMessage(from, {
-      text: "Sorry, I'm having a little trouble right now! I'll get back to you shortly. 😊",
-    });
+    try {
+      await sock.sendMessage(from, {
+        text: "Sorry, I'm having a little trouble right now! I'll get back to you shortly. 😊",
+      });
+    } catch (_) {}
   }
 }
 
@@ -198,10 +266,19 @@ async function handleIncoming(from, userMessage) {
 const app = express();
 app.use(express.json());
 
-// Health check
 app.get('/', (req, res) => res.send('Priya bot is running ✅'));
 
-// QR code page — open this in browser to scan
+// Diagnostic endpoint — useful to check live state without waiting for logs
+app.get('/status', (req, res) => {
+  res.json({
+    hasQR: Boolean(latestQR),
+    isConnecting,
+    reconnectPending: Boolean(reconnectTimer),
+    sessionFiles: fs.existsSync(SESSION_DIR) ? fs.readdirSync(SESSION_DIR) : [],
+    activeUsers: Object.keys(memory).length,
+  });
+});
+
 app.get('/qr', async (req, res) => {
   if (!latestQR) {
     return res.send(`<html><head><meta http-equiv="refresh" content="5"></head>
@@ -209,7 +286,7 @@ app.get('/qr', async (req, res) => {
       <h2>⏳ Waiting for QR...</h2>
       <p style="color:#aaa">If this stays here, the bot has a stale session.</p>
       <p><a href="/reset" style="color:#e74c3c;font-size:18px;font-weight:bold">👉 Click here to reset & get fresh QR</a></p>
-      <p style="color:#555;font-size:13px">Page auto-refreshes every 5 seconds</p>
+      <p style="color:#555;font-size:13px">Page auto-refreshes every 5 seconds · <a href="/status" style="color:#888">/status</a></p>
     </body></html>`);
   }
   try {
@@ -226,32 +303,19 @@ app.get('/qr', async (req, res) => {
   }
 });
 
-// In-process reset — wipes auth, tears down socket, reconnects without exiting
+// In-process reset — wipes auth contents, tears down socket, reconnects
 app.get('/reset', async (req, res) => {
   console.log('🔄 In-process reset triggered');
-  const sessionDir = path.join(process.cwd(), 'auth_session');
 
-  // Tear down existing socket so listeners don't double up
-  try {
-    if (sock) {
-      sock.ev.removeAllListeners();
-      sock.end(undefined);
-    }
-  } catch (e) {
-    console.error('Socket teardown error:', e.message);
+  // Cancel any pending reconnect first
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
 
-  // Wipe auth folder (recursive — handles any subdirs Baileys created)
-  try {
-    if (fs.existsSync(sessionDir)) {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-      console.log('🗑️  Auth session cleared');
-    }
-  } catch (e) {
-    console.error('Wipe error:', e.message);
-  }
+  safeSocketTeardown();
+  wipeAuthSession();
 
-  // Clear cached QR + per-user memory
   latestQR = null;
   for (const k of Object.keys(memory)) delete memory[k];
 
@@ -262,10 +326,12 @@ app.get('/reset', async (req, res) => {
     <p><a href="/qr" style="color:#25d366">Go to QR page</a></p>
   </body></html>`);
 
-  // Reconnect after the response flushes — no process exit, no Railway restart needed
+  // Reconnect after the response flushes — gives Baileys' teardown time
   setTimeout(() => {
-    connectToWhatsApp().catch((err) => console.error('Reconnect failed:', err));
-  }, 1000);
+    connectToWhatsApp().catch((err) =>
+      console.error('Reconnect failed:', err?.message || err)
+    );
+  }, 1500);
 });
 
 // Webhook: trigger bot to message a new lead (e.g. from your website form)
@@ -295,4 +361,6 @@ app.post('/new-lead', async (req, res) => {
 app.listen(PORT, () => console.log(`🌐 Server running on port ${PORT}`));
 
 // ─── START ──────────────────────────────────────────────────────────────────
-connectToWhatsApp();
+connectToWhatsApp().catch((err) =>
+  console.error('Initial connect failed:', err?.message || err)
+);
