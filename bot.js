@@ -26,7 +26,9 @@ const HUMAN_HANDOFF_NUMBER  = process.env.HUMAN_HANDOFF_NUMBER || ''; // e.g. 91
 const PACKAGES_CSV_URL      = process.env.PACKAGES_CSV_URL || '';     // published Google Sheet CSV
 const PORT                  = process.env.PORT || 3000;
 const HISTORY_LIMIT         = 6; // 3 user + 3 bot messages
-const GEMINI_MODEL          = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const GEMINI_MODEL          = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// Try these in order if the primary model returns 404 / "not found" / "no longer available"
+const GEMINI_FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.5-pro', 'gemini-pro-latest'];
 const SESSION_DIR           = path.join(process.cwd(), 'auth_session');
 const RECONNECT_BACKOFF_MS  = 3000;
 
@@ -42,13 +44,30 @@ process.on('unhandledRejection', (e) => {
 const genAI = new GoogleGenerativeAI(GEMINI_KEY);
 // systemInstruction belongs HERE (on getGenerativeModel), not on startChat.
 // We use a function so it's evaluated lazily once packages load.
+// Track which model is currently working — flips to a fallback on 404
+let activeModel = GEMINI_MODEL;
+
 function getModel(systemInstruction) {
   return genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
+    model: activeModel,
     systemInstruction,
   });
 }
-console.log(`🤖 Using Gemini model: ${GEMINI_MODEL}`);
+
+// If the active model returns 404 / "not available", switch to the next
+// fallback so future calls don't keep failing. Returns true if switched.
+function maybeSwitchModel(errMsg) {
+  const dead = /(not found|no longer available|is not supported)/i.test(errMsg || '');
+  if (!dead) return false;
+  const candidates = GEMINI_FALLBACK_MODELS.filter((m) => m !== activeModel);
+  if (!candidates.length) return false;
+  const next = candidates[0];
+  console.log(`🔁 Gemini model "${activeModel}" unavailable. Switching to "${next}".`);
+  activeModel = next;
+  return true;
+}
+
+console.log(`🤖 Using Gemini model: ${activeModel} (fallbacks: ${GEMINI_FALLBACK_MODELS.join(', ')})`);
 
 // ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Priya, a friendly travel consultant for Dream Travels, based in India.
@@ -314,10 +333,32 @@ async function handleIncoming(from, userMessage) {
       userMem.history = userMem.history.slice(-HISTORY_LIMIT);
     }
   } catch (e) {
-    // Truncate so a huge HTML/JSON dump doesn't pollute logs
     const trimmed = (e?.message || String(e)).slice(0, 500);
     console.error('AI error:', trimmed);
     if (e?.stack) console.error('AI error stack:', e.stack.slice(0, 800));
+
+    // If the model is dead, switch to a fallback and retry once before giving up
+    if (maybeSwitchModel(trimmed)) {
+      try {
+        const model2 = getModel(fullPrompt);
+        const chat2 = model2.startChat({ history: chatHistory });
+        const result2 = await chat2.sendMessage(userMessage);
+        const reply2 = (result2.response.text() || '').trim();
+        if (reply2) {
+          console.log(`[${from}] Priya (after model switch): ${reply2}`);
+          userMem.history.push({ role: 'user', content: userMessage });
+          await sock.sendMessage(from, { text: reply2 });
+          userMem.history.push({ role: 'model', content: reply2 });
+          if (userMem.history.length > HISTORY_LIMIT) {
+            userMem.history = userMem.history.slice(-HISTORY_LIMIT);
+          }
+          return;
+        }
+      } catch (e2) {
+        console.error('AI error (after fallback):', (e2?.message || String(e2)).slice(0, 500));
+      }
+    }
+
     try {
       await sock.sendMessage(from, {
         text: "Sorry, I'm having a little trouble right now! I'll get back to you shortly. 😊",
