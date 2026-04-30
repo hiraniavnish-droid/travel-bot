@@ -2,6 +2,8 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  fetchLatestBaileysVersion,
+  Browsers,
 } = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const qrcode = require('qrcode-terminal');
@@ -147,10 +149,27 @@ async function connectToWhatsApp() {
 
     const { state, saveCreds } = await useMultiFileAuthState('auth_session');
 
+    // Pin to the LATEST WhatsApp Web protocol version. Baileys 6.7.9 ships
+    // with a hardcoded version that's now stale and WhatsApp silently rejects
+    // the handshake, causing instant connection close + no QR.
+    let version;
+    try {
+      const fetched = await fetchLatestBaileysVersion();
+      version = fetched.version;
+      console.log(`📦 Baileys WA version: ${version.join('.')} (isLatest: ${fetched.isLatest})`);
+    } catch (e) {
+      console.error('Could not fetch latest WA version, using default:', e?.message || e);
+    }
+
     sock = makeWASocket({
+      version,
       auth: state,
-      logger: pino({ level: 'silent' }),
+      // pino at 'warn' so Baileys errors surface in Railway logs (was 'silent')
+      logger: pino({ level: 'warn' }),
       printQRInTerminal: false,
+      browser: Browsers.macOS('Desktop'),
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
     });
 
     // Defense-in-depth: silence any raw WebSocket errors so they don't crash node
@@ -159,7 +178,16 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      // Log every connection.update so we can see what Baileys is actually doing
+      const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = update;
+      console.log('🔌 connection.update:', JSON.stringify({
+        connection,
+        hasQR: Boolean(qr),
+        statusCode: lastDisconnect?.error?.output?.statusCode,
+        errMsg: lastDisconnect?.error?.message,
+        isNewLogin,
+        receivedPendingNotifications,
+      }));
 
       if (qr) {
         latestQR = qr;
