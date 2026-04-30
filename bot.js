@@ -26,6 +26,7 @@ const HUMAN_HANDOFF_NUMBER  = process.env.HUMAN_HANDOFF_NUMBER || ''; // e.g. 91
 const PACKAGES_CSV_URL      = process.env.PACKAGES_CSV_URL || '';     // published Google Sheet CSV
 const PORT                  = process.env.PORT || 3000;
 const HISTORY_LIMIT         = 6; // 3 user + 3 bot messages
+const GEMINI_MODEL          = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const SESSION_DIR           = path.join(process.cwd(), 'auth_session');
 const RECONNECT_BACKOFF_MS  = 3000;
 
@@ -43,10 +44,11 @@ const genAI = new GoogleGenerativeAI(GEMINI_KEY);
 // We use a function so it's evaluated lazily once packages load.
 function getModel(systemInstruction) {
   return genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash',
+    model: GEMINI_MODEL,
     systemInstruction,
   });
 }
+console.log(`🤖 Using Gemini model: ${GEMINI_MODEL}`);
 
 // ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Priya, a friendly travel consultant for Dream Travels, based in India.
