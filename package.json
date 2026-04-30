@@ -1,0 +1,20 @@
+{
+  "name": "travel-bot-wa",
+  "version": "1.0.0",
+  "description": "WhatsApp AI Travel Agent — Priya",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "@google/generative-ai": "^0.21.0",
+    "qrcode-terminal": "^0.12.0",
+    "qrcode": "^1.5.4",
+    "pino": "^9.4.0",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
