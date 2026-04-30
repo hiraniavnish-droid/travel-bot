@@ -81,56 +81,123 @@ const SYSTEM_PROMPT = `You are Priya, a friendly travel consultant for Dream Tra
 ## Personality
 - Warm, helpful, fast — never pushy, never interview-style
 - Use Hindi-English mix when the customer does (e.g. "Bahut accha choice!")
-- Keep messages SHORT — 2-4 lines max. This is WhatsApp, not email.
+- Keep messages SHORT for WhatsApp, never email-length
 - Use 1-2 emojis max per message, never spam
 
-## Conversation flow (CRITICAL — follow this exactly)
-- Ask AT MOST ONE qualifying question total before sharing packages. Just one. Not two, not three.
-- The qualifying question should be the SINGLE most important thing you don't already know — usually destination if not mentioned, OR rough dates if destination is clear.
-- As SOON as you know the destination (even roughly), share 1-2 matching packages from the package list below in a concise WhatsApp-friendly way: name + 2-3 key highlights + duration. Never list more than 2 packages in one message.
-- After sharing packages, ASK if they want more details on a specific one — don't keep qualifying.
-- If customer's first message already names a destination (e.g. "do you do Goa?"), skip the qualifying question entirely and share Goa packages immediately.
+## Conversation flow (CRITICAL)
+- Ask AT MOST ONE qualifying question total before sharing packages. If destination or vibe is already in their message, skip questions entirely and go straight to packages.
+- As soon as you have a destination/region/category clue, share 2-3 matching packages from the "RELEVANT TOURS" list below.
+- After sharing, ask if they'd like the full itinerary for any of them. That's it — don't keep qualifying.
+
+## Sharing packages — REQUIRED FORMAT
+When you share tours, send EXACTLY 2-3 of them, formatted like this (use WhatsApp markdown — *bold*, line breaks):
+
+*Gujarat Dwarka Somnath Express*
+4 Days / 3 Nights · ₹15,999
+Dwarkadhish Temple, Somnath Jyotirling, Bet Dwarka
+
+*Gujarat Dwarka Somnath Gir Safari*
+5 Days / 4 Nights · ₹17,999
+Spiritual + wildlife combo with Gir National Park
+
+Want the full day-by-day itinerary for either of these? 😊
+
+Rules for sharing:
+- Always 2 or 3 tours per message — never 1, never 4+
+- Title in *bold*, then duration · price on next line, then a one-line highlights summary
+- One blank line between each tour
+- End with a follow-up question asking if they want the full itinerary
+- Pull only from the RELEVANT TOURS list — never invent tours, prices, or details
+- If price is missing for a tour, just say "Price on request" instead
 
 ## Rules
-- Never quote prices unless the customer explicitly asks
-- For destinations not in the package list below: say "Let me check with my team and get back to you!" then add [HANDOFF] on a new line
-- For discount requests: say "I'll see what we can arrange — let me connect you with my senior!" then add [HANDOFF] on a new line
-- When lead is ready to book, confirms dates, asks about payment, or wants to speak to a human: add [HANDOFF] on a new line at the very end of your reply
-- Never invent packages, prices, or details not in the data provided
-- Keep your reply conversational — never bullet-point everything, it looks robotic on WhatsApp. Use natural sentences with line breaks.`;
+- For destinations not in the tours below: "Let me check with my team and get back to you!" then add [HANDOFF] on a new line
+- For discount requests: "I'll see what we can arrange — let me connect you with my senior!" then add [HANDOFF] on a new line
+- When lead is ready to book, confirms dates, asks about payment, or wants to speak to a human: add [HANDOFF] on a new line at the very end
+- Never invent tours, prices, or details not in the data provided`;
 
-// ─── PACKAGE CACHE (Google Sheets CSV) ─────────────────────────────────────
-let packagesCache = { data: '', fetchedAt: 0 };
+// ─── TOURS CATALOG (local JSON, with keyword filtering) ────────────────────
+let TOURS = [];
 
-async function getPackages() {
-  if (!PACKAGES_CSV_URL) return '';
-  const now = Date.now();
-  if (packagesCache.data && (now - packagesCache.fetchedAt) < 5 * 60 * 1000) {
-    return packagesCache.data;
-  }
+function loadTours() {
   try {
-    const res = await fetch(PACKAGES_CSV_URL);
-    const body = await res.text();
-
-    // Detect if Google Sheets returned HTML (editor URL) instead of CSV.
-    // Published CSV URLs return text/csv with no HTML markup; the editor
-    // URL returns the full HTML viewer page which would poison the prompt.
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    const looksHtml = body.trimStart().startsWith('<') || ct.includes('html');
-    if (looksHtml) {
-      console.error(`⚠️  PACKAGES_CSV_URL returned HTML, not CSV. Got content-type="${ct}". ` +
-        `Fix: in Google Sheets use File → Share → Publish to web → CSV, then paste THAT url ` +
-        `(should look like https://docs.google.com/spreadsheets/d/e/.../pub?output=csv).`);
-      return packagesCache.data || '';
+    const file = path.join(process.cwd(), 'tours.json');
+    if (!fs.existsSync(file)) {
+      console.error(`⚠️  tours.json not found at ${file} — Priya will reply without packages`);
+      TOURS = [];
+      return;
     }
-
-    packagesCache = { data: body, fetchedAt: now };
-    console.log(`✅ Packages refreshed from Google Sheets (${body.length} bytes)`);
-    return body;
+    const raw = fs.readFileSync(file, 'utf8');
+    TOURS = JSON.parse(raw);
+    console.log(`📚 Loaded ${TOURS.length} tours from tours.json`);
   } catch (e) {
-    console.error('⚠️  Failed to fetch packages:', e.message);
-    return packagesCache.data || '';
+    console.error('Failed to load tours.json:', e.message);
+    TOURS = [];
   }
+}
+
+// Common words to ignore when scoring keyword matches
+const STOP_WORDS = new Set([
+  'the','a','an','and','or','but','is','are','was','were','be','been','being',
+  'i','we','you','they','he','she','it','my','our','your','their','this','that',
+  'do','does','did','have','has','had','will','would','can','could','should','may',
+  'to','for','from','in','on','at','of','with','about','like','want','need','looking',
+  'please','tell','show','share','send','some','any','all','very','really','just',
+  'tour','tours','package','packages','trip','trips','travel','holiday','holidays',
+  'vacation','vacations','itinerary','itineraries','plan','plans',
+  'day','days','night','nights','week','weeks',
+  'hi','hello','hey','yes','no','ok','okay','sure','thanks','thank',
+]);
+
+// Score each tour against the user's recent messages and return top N matches.
+function findRelevantTours(userMessage, history, limit = 8) {
+  if (!TOURS.length) return [];
+
+  // Combine current message with last 2 user messages for richer context
+  const recentUser = history
+    .filter((m) => m.role === 'user')
+    .slice(-2)
+    .map((m) => m.content)
+    .join(' ');
+  const q = `${userMessage} ${recentUser}`.toLowerCase();
+
+  const words = Array.from(new Set(
+    q.split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && !STOP_WORDS.has(w))
+  ));
+
+  // No useful keywords — return a small default subset so Priya has something
+  if (!words.length) return TOURS.slice(0, limit);
+
+  const scored = TOURS.map((t) => {
+    const titleLc = (t.title || '').toLowerCase();
+    const meta = `${t.destination || ''} ${t.destinations || ''} ${t.categories || ''}`.toLowerCase();
+    let score = 0;
+    for (const w of words) {
+      if (titleLc.includes(w)) score += 3; // title match weighted heaviest
+      else if (meta.includes(w)) score += 1;
+    }
+    return { tour: t, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const matched = scored.filter((s) => s.score > 0).slice(0, limit).map((s) => s.tour);
+  return matched.length ? matched : TOURS.slice(0, limit);
+}
+
+// Format a list of tours into a compact text block Gemini can ground on.
+function formatToursForPrompt(tours) {
+  return tours.map((t) => {
+    const lines = [];
+    lines.push(`TOUR: ${t.title}`);
+    if (t.destination) lines.push(`DESTINATION: ${t.destination}`);
+    if (t.duration) lines.push(`DURATION: ${t.duration}`);
+    if (t.price) lines.push(`PRICE: ${t.price}`);
+    if (t.overview) lines.push(`OVERVIEW: ${(t.overview || '').replace(/\s+/g, ' ').slice(0, 240)}`);
+    if (Array.isArray(t.highlights) && t.highlights.length) {
+      lines.push(`HIGHLIGHTS: ${t.highlights.slice(0, 4).join('; ')}`);
+    }
+    return lines.join('\n');
+  }).join('\n---\n');
 }
 
 // ─── IN-MEMORY + DISK-PERSISTED STORAGE ────────────────────────────────────
@@ -365,9 +432,13 @@ async function handleIncoming(from, userMessage) {
   if (!memory[from]) memory[from] = { history: [], handedOff: false };
   const userMem = memory[from];
 
-  const packagesData = await getPackages();
-  const fullPrompt = packagesData
-    ? `${SYSTEM_PROMPT}\n\n## Current Packages (use ONLY these)\n\n${packagesData}`
+  // Pick the 6-8 most relevant tours for this conversation and send only
+  // those to Gemini. Avoids dumping all 190 tours every call.
+  const relevantTours = findRelevantTours(userMessage, userMem.history, 8);
+  console.log(`[${from}] Relevant tours: ${relevantTours.map((t) => t.title).join(' | ')}`);
+  const packagesBlock = relevantTours.length ? formatToursForPrompt(relevantTours) : '';
+  const fullPrompt = packagesBlock
+    ? `${SYSTEM_PROMPT}\n\n## RELEVANT TOURS (pick 2-3 of these to share)\n\n${packagesBlock}`
     : SYSTEM_PROMPT;
 
   const chatHistory = userMem.history.map((m) => ({
@@ -470,6 +541,7 @@ app.get('/status', (req, res) => {
     reconnectPending: Boolean(reconnectTimer),
     activeModel,
     historyLimit: HISTORY_LIMIT,
+    toursLoaded: TOURS.length,
     sessionFiles: fs.existsSync(SESSION_DIR)
       ? fs.readdirSync(SESSION_DIR).filter((n) => n !== 'conversations')
       : [],
@@ -561,6 +633,7 @@ app.post('/new-lead', async (req, res) => {
 app.listen(PORT, () => console.log(`🌐 Server running on port ${PORT}`));
 
 // ─── START ──────────────────────────────────────────────────────────────────
+loadTours();
 loadConversationsFromDisk();
 console.log(`💾 HISTORY_LIMIT: ${HISTORY_LIMIT} messages per customer`);
 connectToWhatsApp().catch((err) =>
