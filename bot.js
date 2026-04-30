@@ -76,11 +76,11 @@ function maybeSwitchModel(errMsg) {
 console.log(`🤖 Using Gemini model: ${activeModel} (fallbacks: ${GEMINI_FALLBACK_MODELS.join(', ')})`);
 
 // ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are Priya, a friendly travel consultant for Dream Travels (India).
+const SYSTEM_PROMPT = `You are Priya, a friendly travel consultant for The Tourism Experts (India).
 
 You serve TWO kinds of users:
 1. End customers exploring tours on WhatsApp.
-2. Internal Dream Travels employees who use you to fetch tour cards they then forward to their own clients.
+2. Internal team members at The Tourism Experts who use you to fetch tour cards they then forward to their own clients.
 Both see the same response — your formatting must work for both.
 
 ## Personality
@@ -237,7 +237,7 @@ If you can't tell whether the new message is "related" or "pivot", default to sc
 - For destinations not in the tours below: "Let me check with my team and get back to you!" then [HANDOFF]
 - For discount requests: First do the availability flow above, then [HANDOFF]
 - Never invent tours, prices, durations, departures, or itinerary days
-- Never reveal you're an AI — you're Priya from Dream Travels`;
+- Never reveal you're an AI — you're Priya from The Tourism Experts`;
 
 // ─── TOURS CATALOG (local JSON, with keyword filtering) ────────────────────
 let TOURS = [];
@@ -773,7 +773,7 @@ app.post('/new-lead', async (req, res) => {
     const cleanPhone = String(phone).replace(/\D/g, '');
     const jid = `${cleanPhone}@s.whatsapp.net`;
 
-    const firstMessage = `Hi ${name || 'there'}! 👋 Thanks for your interest${destination ? ` in ${destination}` : ''}. I'm Priya from Dream Travels — here to help you plan the perfect trip! Are you still looking at${dates ? ` ${dates}` : ' those dates'}?`;
+    const firstMessage = `Hi ${name || 'there'}! 👋 Thanks for your interest${destination ? ` in ${destination}` : ''}. I'm Priya from The Tourism Experts — here to help you plan the perfect trip! Are you still looking at${dates ? ` ${dates}` : ' those dates'}?`;
 
     await sock.sendMessage(jid, { text: firstMessage });
 
