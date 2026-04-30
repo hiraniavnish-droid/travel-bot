@@ -39,7 +39,14 @@ process.on('unhandledRejection', (e) => {
 
 // ─── AI SETUP ──────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+// systemInstruction belongs HERE (on getGenerativeModel), not on startChat.
+// We use a function so it's evaluated lazily once packages load.
+function getModel(systemInstruction) {
+  return genAI.getGenerativeModel({
+    model: 'gemini-1.5-flash',
+    systemInstruction,
+  });
+}
 
 // ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Priya, a friendly travel consultant for Dream Travels, based in India.
@@ -70,10 +77,23 @@ async function getPackages() {
   }
   try {
     const res = await fetch(PACKAGES_CSV_URL);
-    const csv = await res.text();
-    packagesCache = { data: csv, fetchedAt: now };
-    console.log('✅ Packages refreshed from Google Sheets');
-    return csv;
+    const body = await res.text();
+
+    // Detect if Google Sheets returned HTML (editor URL) instead of CSV.
+    // Published CSV URLs return text/csv with no HTML markup; the editor
+    // URL returns the full HTML viewer page which would poison the prompt.
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    const looksHtml = body.trimStart().startsWith('<') || ct.includes('html');
+    if (looksHtml) {
+      console.error(`⚠️  PACKAGES_CSV_URL returned HTML, not CSV. Got content-type="${ct}". ` +
+        `Fix: in Google Sheets use File → Share → Publish to web → CSV, then paste THAT url ` +
+        `(should look like https://docs.google.com/spreadsheets/d/e/.../pub?output=csv).`);
+      return packagesCache.data || '';
+    }
+
+    packagesCache = { data: body, fetchedAt: now };
+    console.log(`✅ Packages refreshed from Google Sheets (${body.length} bytes)`);
+    return body;
   } catch (e) {
     console.error('⚠️  Failed to fetch packages:', e.message);
     return packagesCache.data || '';
@@ -177,6 +197,7 @@ async function connectToWhatsApp() {
       browser: Browsers.macOS('Desktop'),
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      defaultQueryTimeoutMs: 60_000,
     });
 
     // Defense-in-depth: silence any raw WebSocket errors so they don't crash node
@@ -252,13 +273,16 @@ async function handleIncoming(from, userMessage) {
   }));
 
   try {
-    const chat = model.startChat({
-      history: chatHistory,
-      systemInstruction: fullPrompt,
-    });
+    // Build a model with the system prompt baked in (correct API placement)
+    const model = getModel(fullPrompt);
+    const chat = model.startChat({ history: chatHistory });
 
     const result = await chat.sendMessage(userMessage);
-    let reply = result.response.text().trim();
+    let reply = (result.response.text() || '').trim();
+    if (!reply) {
+      console.error(`⚠️  Empty Gemini reply for [${from}]. Falling back.`);
+      reply = "I'm here! Could you tell me a bit more about what you're looking for? 😊";
+    }
 
     console.log(`[${from}] Priya: ${reply}`);
 
@@ -288,7 +312,10 @@ async function handleIncoming(from, userMessage) {
       userMem.history = userMem.history.slice(-HISTORY_LIMIT);
     }
   } catch (e) {
-    console.error('AI error:', e.message);
+    // Truncate so a huge HTML/JSON dump doesn't pollute logs
+    const trimmed = (e?.message || String(e)).slice(0, 500);
+    console.error('AI error:', trimmed);
+    if (e?.stack) console.error('AI error stack:', e.stack.slice(0, 800));
     try {
       await sock.sendMessage(from, {
         text: "Sorry, I'm having a little trouble right now! I'll get back to you shortly. 😊",
