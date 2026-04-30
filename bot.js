@@ -72,6 +72,9 @@ let latestQR = null;
 let sock;
 
 async function connectToWhatsApp() {
+  // Clean up any prior socket so listeners don't pile up across resets
+  try { if (sock) { sock.ev.removeAllListeners(); sock.end(undefined); } } catch (_) {}
+
   const { state, saveCreds } = await useMultiFileAuthState('auth_session');
 
   sock = makeWASocket({
@@ -98,6 +101,7 @@ async function connectToWhatsApp() {
       if (shouldReconnect) connectToWhatsApp();
     } else if (connection === 'open') {
       console.log('✅ WhatsApp connected!');
+      latestQR = null;
     }
   });
 
@@ -222,24 +226,46 @@ app.get('/qr', async (req, res) => {
   }
 });
 
-// Reset session — wipes auth files then restarts the process (Railway auto-restarts)
-app.get('/reset', (req, res) => {
+// In-process reset — wipes auth, tears down socket, reconnects without exiting
+app.get('/reset', async (req, res) => {
+  console.log('🔄 In-process reset triggered');
   const sessionDir = path.join(process.cwd(), 'auth_session');
-  if (fs.existsSync(sessionDir)) {
-    for (const file of fs.readdirSync(sessionDir)) {
-      try { fs.unlinkSync(path.join(sessionDir, file)); } catch (_) {}
+
+  // Tear down existing socket so listeners don't double up
+  try {
+    if (sock) {
+      sock.ev.removeAllListeners();
+      sock.end(undefined);
     }
-    console.log('🗑️  Auth session cleared — restarting process');
+  } catch (e) {
+    console.error('Socket teardown error:', e.message);
   }
-  res.send(`<html><head><meta http-equiv="refresh" content="8;url=/qr"></head>
+
+  // Wipe auth folder (recursive — handles any subdirs Baileys created)
+  try {
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      console.log('🗑️  Auth session cleared');
+    }
+  } catch (e) {
+    console.error('Wipe error:', e.message);
+  }
+
+  // Clear cached QR + per-user memory
+  latestQR = null;
+  for (const k of Object.keys(memory)) delete memory[k];
+
+  res.send(`<html><head><meta http-equiv="refresh" content="6;url=/qr"></head>
   <body style="font-family:sans-serif;text-align:center;padding:60px;background:#111;color:#fff">
-    <h2>🔄 Restarting bot...</h2>
-    <p style="color:#aaa">Session cleared. Railway is restarting the bot now.</p>
-    <p style="color:#aaa">You'll be redirected to the QR page in 8 seconds.</p>
-    <p><a href="/qr" style="color:#25d366">Go to QR page manually</a></p>
+    <h2>🔄 Reset complete</h2>
+    <p style="color:#aaa">Reconnecting to WhatsApp — fresh QR in a few seconds.</p>
+    <p><a href="/qr" style="color:#25d366">Go to QR page</a></p>
   </body></html>`);
-  // Exit after sending response — Railway restarts automatically
-  setTimeout(() => process.exit(1), 500);
+
+  // Reconnect after the response flushes — no process exit, no Railway restart needed
+  setTimeout(() => {
+    connectToWhatsApp().catch((err) => console.error('Reconnect failed:', err));
+  }, 1000);
 });
 
 // Webhook: trigger bot to message a new lead (e.g. from your website form)
