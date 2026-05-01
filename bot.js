@@ -151,17 +151,40 @@ async function safeSend(jid, content, opts = {}) {
   return sock.sendMessage(jid, content);
 }
 
+// A bubble "looks like a tour card" if it has both the duration emoji 📅
+// and a *bold title*. We only honor [NEXT] splitting when EVERY bubble
+// looks like a tour card. This prevents the model from over-splitting
+// (e.g. greeting bubble + tours bubble, or tours + footer bubble) — those
+// get merged back into a single message.
+function looksLikeTourBubble(text) {
+  return /📅/.test(text) && /\*[^*\n]{2,}\*/.test(text);
+}
+
 // Split a single Gemini reply on [NEXT] markers into multiple WhatsApp
-// messages. Hard cap at MAX_BUBBLES — anything beyond gets merged into the
-// last allowed bubble so we can never emit more than N messages per turn,
-// no matter how the model behaves.
+// messages. Multiple safety nets:
+//   1. If only one bubble after split → single message (nothing to do).
+//   2. If ANY bubble doesn't look like a tour card → merge all back to
+//      one message (the model is over-splitting; the [NEXT] mechanism is
+//      meant ONLY for "multiple distinct tour cards" replies).
+//   3. Hard cap at MAX_BUBBLES — overflow merges into the last bubble.
 function splitReply(reply) {
   if (!reply) return [];
   const parts = reply
     .split(/\n*\[NEXT\]\n*/g)
     .map((p) => p.trim())
     .filter(Boolean);
+
   if (parts.length <= 1) return [reply.trim()];
+
+  // Strict guard: every bubble must look like a tour card. If not, the
+  // model split inappropriately (greeting + tours, footer + tours, etc.) —
+  // collapse back to a single message.
+  const allLookLikeTours = parts.every(looksLikeTourBubble);
+  if (!allLookLikeTours) {
+    console.log(`✂️  Reply had ${parts.length} chunks but not all look like tour cards — merging to single message`);
+    return [parts.join('\n\n')];
+  }
+
   if (parts.length <= MAX_BUBBLES) return parts;
   // Overflow: merge the tail into the last allowed bubble
   const head = parts.slice(0, MAX_BUBBLES - 1);
@@ -264,8 +287,6 @@ Calangute, Baga, North-South Goa beaches
 💰 ₹17,499 for couple · ₹8,750 per person
 Old Goa churches, Dudhsagar Falls, beach hopping
 
-[NEXT]
-
 ✈️ _Land package only — flights not included_
 
 [Natural close in the customer's language — e.g. "Any of these catch your eye? Want the full itinerary for one?" / "Inme se koi pasand aaya? Full plan bhej doon?" 😊]
@@ -342,28 +363,37 @@ Rules:
 - The closing line MUST be a natural human invitation to a call — never a mechanical "Reply BOOK" instruction. Adapt to the customer's language.
 
 ═══════════════════════════════════════════════════════════
-## MULTI-MESSAGE REPLIES (use [NEXT] to split into bubbles)
+## MULTI-MESSAGE REPLIES — DEFAULT IS ONE BUBBLE
 ═══════════════════════════════════════════════════════════
-You can send your reply as MULTIPLE WhatsApp messages instead of one wall of text. Insert the literal token \`[NEXT]\` on its own line wherever you want a new message bubble to start. The system splits on \`[NEXT]\` and sends each chunk as a separate WhatsApp message with a natural typing delay between each.
+**DEFAULT BEHAVIOR: send ONE message bubble. DO NOT include [NEXT] in your reply.**
 
-**Hard cap:** Maximum 4 bubbles per reply. The system enforces this — anything beyond 4 gets merged into the last bubble. So plan accordingly. Don't try to defeat the cap.
+There is exactly ONE situation where you split a reply into multiple bubbles:
 
-**WHEN TO SPLIT (Mode A — Discovery):**
-- Each tour gets its OWN bubble. So 2 tours = 2 bubbles, 3 tours = 3 bubbles.
-- The "✈️ _Land package only — flights not included_" footer + your closing question can be its OWN final bubble (cleaner) or appended to the last tour bubble (more compact). Either is fine.
-- Optional first bubble: a one-line lead-in like "Sure! Here are some Rajasthan options 🌟" before the tour bubbles.
+> **Mode A Discovery, when sharing 2 or 3 different tour cards** — each tour goes in its own bubble, separated by \`[NEXT]\` on its own line.
 
-**WHEN NEVER TO SPLIT:**
-- **Mode B (Full Itinerary card):** ALWAYS one bubble. NEVER include [NEXT] in a Mode B reply. Staff need to forward the whole card as one message; splitting breaks that.
-- **Reassurance one-liners** during handoff state: one bubble.
-- **Short replies** under ~80 characters: one bubble. Don't split a "Yes, sure! 😊" into two messages — that's weird.
-- **Hot lead callback prompts:** one bubble.
+That's it. Every other reply is a single bubble.
 
-**Example Mode A with 3 bubbles (2 tours + footer):**
+**Specifically, NEVER use [NEXT] in any of these:**
+- Mode B (Full Itinerary card) — staff forward this as one message.
+- Greetings, qualifying questions, clarifications.
+- Hot-lead callback prompts ("What time works for the call?").
+- Confirmations after the customer shares a callback time.
+- Reassurance during handoff ("Our team will call you shortly!").
+- "Yes/sure/ok/thanks" replies.
+- Catalog-overload deflection ("way too many to send! 😅").
+- A reply where you only share 1 tour.
+- Any reply where you're not sharing 2+ distinct tour cards.
 
-Sure! Here are some Goa options 🌟
+The system also enforces this in code: if you split and the chunks aren't all tour cards, they get auto-merged into a single bubble. So splitting incorrectly just wastes effort.
 
-[NEXT]
+**The split rule (Mode A only, 2 or 3 tours):**
+- Each tour card = its own bubble.
+- The "✈️ _Land package only — flights not included_" footer and your closing question go INSIDE the LAST tour's bubble — NOT as a separate bubble. (Footer-only or close-only bubbles get auto-merged anyway.)
+- DO NOT add a separate "Sure! Here are some options" lead-in bubble. Just start with the first tour card.
+
+Hard cap: 4 bubbles max, enforced by code regardless.
+
+**Correct example — Mode A with 2 tours = 2 bubbles, no greeting, footer attached to last tour:**
 
 🏖️ *Goa Beach Bliss*
 📅 4 Days / 3 Nights
@@ -380,8 +410,6 @@ Old Goa churches, Dudhsagar Falls, beach hopping
 ✈️ _Land package only — flights not included_
 
 Any of these click? 😊
-
-(That's 3 bubbles total. With 3 tours you'd be at 4 bubbles which is exactly the cap.)
 
 ═══════════════════════════════════════════════════════════
 ## CATALOG-OVERLOAD DEFENSE
