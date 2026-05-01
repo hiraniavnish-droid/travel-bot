@@ -151,6 +151,29 @@ async function safeSend(jid, content, opts = {}) {
   return sock.sendMessage(jid, content);
 }
 
+// Sanitize chat history before handing it to Gemini's startChat().
+// Gemini requires:
+//   1. The first message must have role 'user' (a leading 'model' message
+//      throws "First content should be with role 'user', got model").
+//   2. Roles must strictly alternate user/model/user/model...
+// Persisted conversations CAN end up violating these — e.g. /new-lead
+// initiates with a model message, a Baileys fromMe event slips in during
+// a restart, or a previous bug wrote an unexpected order.
+// This function drops leading non-user entries and collapses consecutive
+// same-role runs (keeps the first), then maps to Gemini's expected shape.
+function sanitizeHistoryForGemini(history) {
+  const out = [];
+  for (const m of history || []) {
+    if (!m || !m.content) continue;
+    // Skip until we see the first 'user' message
+    if (out.length === 0 && m.role !== 'user') continue;
+    // Strict alternation — drop any consecutive same-role entries
+    if (out.length > 0 && out[out.length - 1].role === m.role) continue;
+    out.push({ role: m.role, content: m.content });
+  }
+  return out.map((m) => ({ role: m.role, parts: [{ text: m.content }] }));
+}
+
 // A bubble "looks like a tour card" if it has both the duration emoji 📅
 // and a *bold title*. We only honor [NEXT] splitting when EVERY bubble
 // looks like a tour card. This prevents the model from over-splitting
@@ -918,10 +941,10 @@ async function handleIncoming(from, userMessage) {
     : SYSTEM_PROMPT;
   fullPrompt += stateBlock;
 
-  const chatHistory = userMem.history.map((m) => ({
-    role: m.role,
-    parts: [{ text: m.content }],
-  }));
+  // Build the chat history Gemini will see, but sanitize it first:
+  // drop any leading model-role entries (Gemini rejects them) and
+  // collapse consecutive same-role runs (Gemini requires alternation).
+  const chatHistory = sanitizeHistoryForGemini(userMem.history);
 
   try {
     // Build a model with the system prompt baked in (correct API placement)
