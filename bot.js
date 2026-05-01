@@ -174,46 +174,18 @@ function sanitizeHistoryForGemini(history) {
   return out.map((m) => ({ role: m.role, parts: [{ text: m.content }] }));
 }
 
-// A bubble "looks like a tour card" if it has both the duration emoji 📅
-// and a *bold title*. We only honor [NEXT] splitting when EVERY bubble
-// looks like a tour card. This prevents the model from over-splitting
-// (e.g. greeting bubble + tours bubble, or tours + footer bubble) — those
-// get merged back into a single message.
-function looksLikeTourBubble(text) {
-  return /📅/.test(text) && /\*[^*\n]{2,}\*/.test(text);
-}
-
-// Split a single Gemini reply on [NEXT] markers into multiple WhatsApp
-// messages. Multiple safety nets:
-//   1. If only one bubble after split → single message (nothing to do).
-//   2. If ANY bubble doesn't look like a tour card → merge all back to
-//      one message (the model is over-splitting; the [NEXT] mechanism is
-//      meant ONLY for "multiple distinct tour cards" replies).
-//   3. Hard cap at MAX_BUBBLES — overflow merges into the last bubble.
+// Multi-bubble replies are DISABLED. Every reply is sent as ONE WhatsApp
+// message regardless of what the model outputs. If Gemini ever emits a
+// [NEXT] marker (despite the prompt telling it not to), this function
+// strips the marker and joins the content into a single bubble.
 function splitReply(reply) {
   if (!reply) return [];
-  const parts = reply
-    .split(/\n*\[NEXT\]\n*/g)
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  if (parts.length <= 1) return [reply.trim()];
-
-  // Strict guard: every bubble must look like a tour card. If not, the
-  // model split inappropriately (greeting + tours, footer + tours, etc.) —
-  // collapse back to a single message.
-  const allLookLikeTours = parts.every(looksLikeTourBubble);
-  if (!allLookLikeTours) {
-    console.log(`✂️  Reply had ${parts.length} chunks but not all look like tour cards — merging to single message`);
-    return [parts.join('\n\n')];
+  const hadMarker = /\[NEXT\]/.test(reply);
+  const cleaned = reply.replace(/\n*\[NEXT\]\n*/g, '\n\n').trim();
+  if (hadMarker) {
+    console.log(`✂️  Stripped [NEXT] markers from reply — sending as single bubble`);
   }
-
-  if (parts.length <= MAX_BUBBLES) return parts;
-  // Overflow: merge the tail into the last allowed bubble
-  const head = parts.slice(0, MAX_BUBBLES - 1);
-  const tail = parts.slice(MAX_BUBBLES - 1).join('\n\n');
-  console.log(`✂️  Reply had ${parts.length} chunks — capped to ${MAX_BUBBLES} (overflow merged into last bubble)`);
-  return [...head, tail];
+  return cleaned ? [cleaned] : [];
 }
 
 // ─── SAFETY: don't let Baileys teardown crashes kill the process ───────────
@@ -303,8 +275,6 @@ Send EXACTLY 2-3 tours in this format (use *bold*, line breaks):
 💰 ₹14,999 for couple · ₹7,500 per person
 Calangute, Baga, North-South Goa beaches
 
-[NEXT]
-
 🏛️ *Goa Heritage & Beaches*
 📅 5 Days / 4 Nights
 💰 ₹17,499 for couple · ₹8,750 per person
@@ -386,53 +356,13 @@ Rules:
 - The closing line MUST be a natural human invitation to a call — never a mechanical "Reply BOOK" instruction. Adapt to the customer's language.
 
 ═══════════════════════════════════════════════════════════
-## MULTI-MESSAGE REPLIES — DEFAULT IS ONE BUBBLE
+## ALWAYS ONE MESSAGE — NO SPLITS, NO MARKERS
 ═══════════════════════════════════════════════════════════
-**DEFAULT BEHAVIOR: send ONE message bubble. DO NOT include [NEXT] in your reply.**
+**EVERY reply is ONE single WhatsApp message.** Never split. Never use special markers like \`[NEXT]\`, \`[SPLIT]\`, \`---\`, or anything similar. Never mention "sending another message" or "next bubble" — there's only one bubble.
 
-There is exactly ONE situation where you split a reply into multiple bubbles:
+When sharing 2-3 tours in Mode A, put all tours together in a single message separated by blank lines (see the Mode A example earlier). When sharing a Mode B itinerary, the whole card is one message. Greetings, confirmations, reassurance, error fallbacks — all single messages.
 
-> **Mode A Discovery, when sharing 2 or 3 different tour cards** — each tour goes in its own bubble, separated by \`[NEXT]\` on its own line.
-
-That's it. Every other reply is a single bubble.
-
-**Specifically, NEVER use [NEXT] in any of these:**
-- Mode B (Full Itinerary card) — staff forward this as one message.
-- Greetings, qualifying questions, clarifications.
-- Hot-lead callback prompts ("What time works for the call?").
-- Confirmations after the customer shares a callback time.
-- Reassurance during handoff ("Our team will call you shortly!").
-- "Yes/sure/ok/thanks" replies.
-- Catalog-overload deflection ("way too many to send! 😅").
-- A reply where you only share 1 tour.
-- Any reply where you're not sharing 2+ distinct tour cards.
-
-The system also enforces this in code: if you split and the chunks aren't all tour cards, they get auto-merged into a single bubble. So splitting incorrectly just wastes effort.
-
-**The split rule (Mode A only, 2 or 3 tours):**
-- Each tour card = its own bubble.
-- The "✈️ _Land package only — flights not included_" footer and your closing question go INSIDE the LAST tour's bubble — NOT as a separate bubble. (Footer-only or close-only bubbles get auto-merged anyway.)
-- DO NOT add a separate "Sure! Here are some options" lead-in bubble. Just start with the first tour card.
-
-Hard cap: 4 bubbles max, enforced by code regardless.
-
-**Correct example — Mode A with 2 tours = 2 bubbles, no greeting, footer attached to last tour:**
-
-🏖️ *Goa Beach Bliss*
-📅 4 Days / 3 Nights
-💰 ₹14,999 for couple · ₹7,500 per person
-Calangute, Baga, North-South Goa beaches
-
-[NEXT]
-
-🏛️ *Goa Heritage & Beaches*
-📅 5 Days / 4 Nights
-💰 ₹17,499 for couple · ₹8,750 per person
-Old Goa churches, Dudhsagar Falls, beach hopping
-
-✈️ _Land package only — flights not included_
-
-Any of these click? 😊
+The system will strip any separator markers if they leak through, but the cleanest path is to never emit them in the first place.
 
 ═══════════════════════════════════════════════════════════
 ## CATALOG-OVERLOAD DEFENSE
@@ -992,16 +922,15 @@ async function handleIncoming(from, userMessage) {
       }
     }
 
-    // Customer-facing reply: split on [NEXT] (capped at MAX_BUBBLES), then
-    // send each bubble separately. Each bubble goes through safeSend so it
-    // gets its own typing presence + jittered delay + rate-limit token.
+    // Customer-facing reply: always sent as a SINGLE WhatsApp message.
+    // splitReply just strips any stray [NEXT] markers the model might
+    // emit and returns a single-element array. The for-loop is kept so
+    // re-enabling multi-bubble in the future is a one-line change.
     const bubbles = splitReply(reply);
     for (const bubble of bubbles) {
       await safeSend(from, { text: bubble });
     }
 
-    // Persist the joined reply (without [NEXT] markers) to history so the
-    // conversation reads cleanly when Gemini sees prior context.
     userMem.history.push({ role: 'model', content: bubbles.join('\n\n') });
 
     if (userMem.history.length > HISTORY_LIMIT) {
